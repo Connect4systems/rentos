@@ -67,9 +67,7 @@ class Rent(Document):
             new.customer = self.customer
         new_doc.insert(ignore_permissions=True)
         new_doc.submit()
-        frappe.db.sql(f"""
-            UPDATE tabRent SET stock_entry = '{new_doc.name}' WHERE name = '{self.name}'
-        """)
+        frappe.db.set_value("Rent", self.name, "stock_entry", new_doc.name)
 
         # تحديث حالة Rent إلى "Submitted"
         self.db_set('status', 'Submitted')
@@ -95,12 +93,7 @@ class Rent(Document):
                 new.rate = d.rate
             new_invoice.insert(ignore_permissions=True)
             new_invoice.submit()
-            frappe.db.sql(f"""
-            UPDATE tabRent JOIN tabSales Invoice 
-            ON tabRent.name = tabSales Invoice.rent 
-            SET tabRent.sales_invoice = '{new_invoice.name}' 
-            WHERE tabSales Invoice.rent = '{self.name}' AND selling_price_list='Monthly'
-            """)
+            frappe.db.set_value("Rent", self.name, "sales_invoice", new_invoice.name)
 
     @frappe.whitelist()
     def stop_auto_repeat(self):

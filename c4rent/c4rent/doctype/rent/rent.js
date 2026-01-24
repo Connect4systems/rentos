@@ -105,11 +105,11 @@ frappe.ui.form.on("Rent", {
 		});
 	},
 });
-frappe.ui.form.on("Rent", "validate", function() {
-    for (var i = 0; i < cur_frm.doc.time_logs.length; i++) {
-        cur_frm.doc.time_logs[i].uom = cur_frm.doc.rent_type;
+frappe.ui.form.on("Rent", "validate", function(frm) {
+    for (var i = 0; i < frm.doc.time_logs.length; i++) {
+        frm.doc.time_logs[i].uom = frm.doc.rent_type;
     }
-    cur_frm.refresh_field('time_logs');
+    frm.refresh_field('time_logs');
 });
 
 frappe.ui.form.on("Rent Detail", "rate", function(frm, doctype, name) {
@@ -122,13 +122,13 @@ frappe.ui.form.on("Rent", "validate", function(frm, cdt, cdn) {
     $.each(frm.doc.time_logs || [], function(i, d) {
         d.source_warehouse = frm.doc.source_warehouse;
     });
-    cur_frm.refresh_field('time_logs');
+    frm.refresh_field('time_logs');
 });
 
 // Modified the following 'item_code' event to correctly update the rate field in the 'Rent Detail' table.
 frappe.ui.form.on("Rent Detail", "item_code", function(frm, cdt, cdn) {
     const row = locals[cdt][cdn]; // Get current row
-    const priceList = cur_frm.doc.rent_type == "Daily" ? "Daily" : "Monthly";
+    const priceList = frm.doc.rent_type == "Daily" ? "Daily" : "Monthly";
 
     if (row.item_code) {
         frappe.call({
@@ -149,7 +149,7 @@ frappe.ui.form.on("Rent Detail", "item_code", function(frm, cdt, cdn) {
                     frappe.model.set_value(cdt, cdn, 'rate', 0); // Set rate to 0 if no price found
                     frappe.model.set_value(cdt, cdn, 'amount', 0); // Set amount to 0 if no price found
                 }
-                cur_frm.refresh_field('time_logs');
+                frm.refresh_field('time_logs');
             }
         });
     }

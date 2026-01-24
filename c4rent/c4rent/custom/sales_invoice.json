@@ -1003,26 +1003,6 @@
    "parentfield": "links",
    "parenttype": "DocType",
    "table_fieldname": null
-  },
-  {
-   "creation": "2025-02-15 11:07:40.397043",
-   "custom": 1,
-   "docstatus": 0,
-   "group": "Stock Entry",
-   "hidden": 0,
-   "idx": 2,
-   "is_child_table": 0,
-   "link_doctype": "Stock Entry",
-   "link_fieldname": "sales_invoice",
-   "modified": "2025-02-15 11:07:40.397043",
-   "modified_by": "Administrator",
-   "name": "pb9bcj7pc2",
-   "owner": "Administrator",
-   "parent": "Sales Invoice",
-   "parent_doctype": null,
-   "parentfield": "links",
-   "parenttype": "Customize Form",
-   "table_fieldname": null
   }
  ],
  "property_setters": [

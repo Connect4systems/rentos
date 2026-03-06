@@ -1,286 +1,296 @@
+from collections import defaultdict
+
 import frappe
 from frappe import _
-from collections import defaultdict
+from frappe.utils import flt
 
 RENT_STATUS_RETURNED = "Returned"
 RENT_STATUS_PARTIAL_RETURNED = "Partial Returned"
 RENT_STATUS_SUBMITTED = "Submitted"
 
-def before_cancel(doc, method):
-    """
-    BEFORE Sales Invoice cancel (runs before validation):
-    Fully unlink all references between Rent, Stock Entry, and Sales Invoice
-    to avoid 'linked document' errors during cancellation.
-    """
-    try:
-        rent_name = doc.get("rent")
-        if rent_name:
-            # Unlink sales_invoice and stock_entry from Rent
-            frappe.db.set_value("Rent", rent_name, "sales_invoice", None)
-            frappe.db.set_value("Rent", rent_name, "sales_invoice_status", None)
-            frappe.db.set_value("Rent", rent_name, "stock_entry", None)
-        # Find all related Stock Entries
-        stock_entries = frappe.get_all(
+
+def _get_related_submitted_stock_entries(sales_invoice_name):
+    if not sales_invoice_name:
+        return []
+
+    return frappe.get_all(
+        "Stock Entry",
+        filters={"sales_invoice": sales_invoice_name, "docstatus": 1},
+        order_by="creation asc",
+        pluck="name",
+    )
+
+
+def _cancel_related_stock_entries(stock_entry_names):
+    for stock_entry_name in stock_entry_names:
+        stock_entry = frappe.get_doc("Stock Entry", stock_entry_name)
+        if stock_entry.docstatus == 1:
+            stock_entry.cancel()
+
+
+def _wipe_links_on_stock_entries(stock_entry_names):
+    for stock_entry_name in stock_entry_names:
+        frappe.db.set_value(
             "Stock Entry",
-            filters={"sales_invoice": doc.name, "docstatus": 1},
-            pluck="name"
+            stock_entry_name,
+            {"rent": None, "sales_invoice": None, "customer": None},
+            update_modified=False,
         )
-        # Unlink rent from all Stock Entries
-        for stock_entry_name in stock_entries:
-            frappe.db.set_value("Stock Entry", stock_entry_name, "rent", None)
-            frappe.db.set_value("Stock Entry", stock_entry_name, "sales_invoice", None)
-        # Unlink rent and stock_entry from Sales Invoice
-        frappe.db.set_value("Sales Invoice", doc.name, "rent", None)
-        if hasattr(doc, "stock_entry"):
-            frappe.db.set_value("Sales Invoice", doc.name, "stock_entry", None)
-    except Exception as e:
-        frappe.log_error(str(e), "Sales Invoice Before Cancel Error")
+
+
+def _unlink_rent_references_for_cancelled_invoice(rent_name, sales_invoice_name, related_stock_entries=None):
+    if not rent_name or not frappe.db.exists("Rent", rent_name):
+        return
+
+    related_stock_entries = set(related_stock_entries or [])
+    rent_state = frappe.db.get_value(
+        "Rent", rent_name, ["sales_invoice", "stock_entry"], as_dict=True
+    ) or {}
+
+    updates = {}
+    if rent_state.get("sales_invoice") == sales_invoice_name:
+        updates["sales_invoice"] = None
+        updates["sales_invoice_status"] = None
+
+    if rent_state.get("stock_entry") in related_stock_entries:
+        updates["stock_entry"] = None
+
+    if updates:
+        frappe.db.set_value("Rent", rent_name, updates, update_modified=False)
+
+
+def _sync_rent_status(rent_name, preferred_sales_invoice=None):
+    if not rent_name or not frappe.db.exists("Rent", rent_name):
+        return
+
+    rent_doc = frappe.get_doc("Rent", rent_name)
+
+    expected_items = defaultdict(float)
+    for log in rent_doc.time_logs or []:
+        expected_items[log.item_code] += flt(log.qty)
+
+    submitted_invoices = frappe.get_all(
+        "Sales Invoice",
+        fields=["name", "status"],
+        filters={"rent": rent_name, "docstatus": 1},
+        order_by="posting_date desc, creation desc",
+    )
+    submitted_invoice_names = [invoice.name for invoice in submitted_invoices]
+
+    actual_items = defaultdict(float)
+    if submitted_invoice_names:
+        invoice_items = frappe.get_all(
+            "Sales Invoice Item",
+            fields=["item_code", "rent_qty"],
+            filters={
+                "parenttype": "Sales Invoice",
+                "parent": ["in", submitted_invoice_names],
+            },
+        )
+        for item in invoice_items:
+            actual_items[item.item_code] += flt(item.rent_qty)
+
+    is_returned = bool(expected_items) and all(
+        actual_items.get(item_code, 0) >= expected_qty
+        for item_code, expected_qty in expected_items.items()
+    )
+    is_partial_returned = (
+        not is_returned
+        and any(actual_items.get(item_code, 0) > 0 for item_code in expected_items)
+    )
+
+    rent_status = RENT_STATUS_SUBMITTED
+    if is_returned:
+        rent_status = RENT_STATUS_RETURNED
+    elif is_partial_returned:
+        rent_status = RENT_STATUS_PARTIAL_RETURNED
+
+    selected_invoice_name = None
+    selected_invoice_status = None
+    if submitted_invoices:
+        if preferred_sales_invoice and preferred_sales_invoice in submitted_invoice_names:
+            selected_invoice_name = preferred_sales_invoice
+            selected_invoice_status = next(
+                (invoice.status for invoice in submitted_invoices if invoice.name == preferred_sales_invoice),
+                None,
+            )
+        else:
+            selected_invoice_name = submitted_invoices[0].name
+            selected_invoice_status = submitted_invoices[0].status
+
+    frappe.db.set_value(
+        "Rent",
+        rent_name,
+        {
+            "status": rent_status,
+            "sales_invoice": selected_invoice_name,
+            "sales_invoice_status": selected_invoice_status,
+        },
+        update_modified=False,
+    )
+
+
+def before_cancel(doc, method):
+    """Cancel and unlink Stock Entries before Sales Invoice link validation runs."""
+    try:
+        related_stock_entries = _get_related_submitted_stock_entries(doc.name)
+        rent_name = doc.get("rent")
+
+        doc.flags.c4rent_rent_name = rent_name
+        doc.flags.c4rent_related_stock_entries = related_stock_entries
+
+        _cancel_related_stock_entries(related_stock_entries)
+        _wipe_links_on_stock_entries(related_stock_entries)
+        _unlink_rent_references_for_cancelled_invoice(
+            rent_name=rent_name,
+            sales_invoice_name=doc.name,
+            related_stock_entries=related_stock_entries,
+        )
+
+        if doc.meta.has_field("stock_entry"):
+            doc.stock_entry = None
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Sales Invoice Before Cancel Error")
+        raise
+
 
 def on_submit(doc, method):
-    """
-    يتم استدعاؤها عند اعتماد فاتورة مبيعات.
+    if not doc.get("rent"):
+        return
 
-    تقوم بالتحقق من وجود حقل Rent المخصص في الفاتورة،
-    ثم تستدعي الدالة update_rent_status لتحديث حالة Rent.
+    try:
+        rent_doc = frappe.get_doc("Rent", doc.rent)
+        update_rent_status(rent_doc, doc)
+        create_stock_entry(doc)
+    except frappe.DoesNotExistError:
+        frappe.throw(_("Rent document {0} does not exist.").format(doc.rent))
 
-    Args:
-        doc (frappe.Document): فاتورة المبيعات.
-        method (str): اسم الطريقة التي تم استدعاء الدالة بواسطتها.
-    """
-    if doc.get("rent"):
-        try:
-            rent_doc = frappe.get_doc("Rent", doc.rent)
-            update_rent_status(rent_doc, doc)
-            create_stock_entry(doc)
-        except frappe.DoesNotExistError:
-            frappe.msgprint(_("Rent document {} does not exist.").format(doc.rent), raise_exception=True)
-    else:
-        # يمكنك اختيارياً طباعة رسالة هنا إذا كان عدم وجود Rent أمرًا غير متوقع
-        # frappe.msgprint(_("Rent is not linked to this Sales Invoice."))
-        pass
-# def on_update_after_submit(doc, method):
-#     rent_doc = frappe.get_doc("Rent", doc.rent)
-#     frappe.db.set_value('Rent', rent_doc.name , 'sales_invoice_status', doc.status)
+
 def on_change(doc, method):
-    if doc.get("rent"):
-        frappe.db.set_value("Rent", doc.rent, "sales_invoice_status", doc.status)
+    if not doc.get("rent"):
+        return
+
+    linked_invoice = frappe.db.get_value("Rent", doc.rent, "sales_invoice")
+    if linked_invoice == doc.name:
+        frappe.db.set_value(
+            "Rent", doc.rent, "sales_invoice_status", doc.status, update_modified=False
+        )
+
 
 def on_cancel(doc, method):
-    """
-    On Sales Invoice cancel (after validation):
-    1. Cancel all related Stock Entries
-    2. Update Rent status to 'Submitted'
-    """
     try:
-        rent_name = doc.get("rent")
-        # Find all related Stock Entries
-        stock_entries = frappe.get_all(
-            "Stock Entry",
-            filters={"sales_invoice": doc.name, "docstatus": 1},
-            pluck="name"
-        )
-        # Cancel all Stock Entries
-        for stock_entry_name in stock_entries:
-            stock_entry = frappe.get_doc("Stock Entry", stock_entry_name)
-            stock_entry.cancel()
-        # Update Rent status
-        if rent_name:
-            frappe.db.set_value("Rent", rent_name, "status", RENT_STATUS_SUBMITTED)
-    except Exception as e:
-        frappe.log_error(str(e), "Sales Invoice Cancel Error")
-        frappe.msgprint(_("Error during cancellation: {0}").format(str(e)), alert=True, indicator='red')
+        rent_name = doc.flags.get("c4rent_rent_name") or doc.get("rent")
+        related_stock_entries = doc.flags.get("c4rent_related_stock_entries") or []
 
+        _wipe_links_on_stock_entries(related_stock_entries)
+        if doc.meta.has_field("stock_entry"):
+            frappe.db.set_value(
+                "Sales Invoice", doc.name, "stock_entry", None, update_modified=False
+            )
+        _unlink_rent_references_for_cancelled_invoice(
+            rent_name=rent_name,
+            sales_invoice_name=doc.name,
+            related_stock_entries=related_stock_entries,
+        )
+        _sync_rent_status(rent_name)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Sales Invoice Cancel Error")
+        raise
 
 
 def update_rent_status(rent_doc, sales_invoice_doc):
-    """
-    تقوم بالتحقق من الأصناف والكميات في فاتورة المبيعات
-    ومقارنتها بالـ time_logs في الـ Rent والفواتير السابقة.
-    بناءً على النتيجة، يتم تحديث حقل الـ Status إلى "Returned" أو "Partial Returned".
+    """Recompute Rent status and pointers based on submitted Sales Invoices."""
+    _sync_rent_status(rent_doc.name, preferred_sales_invoice=sales_invoice_doc.name)
 
-    Args:
-        rent_doc (frappe.Document): مستند Rent.
-        sales_invoice_doc (frappe.Document): فاتورة المبيعات الحالية.
-    """
-    from collections import defaultdict
 
-    expected_items = defaultdict(float)  # الكميات المتوقعة من الـ Rent
-    actual_items = defaultdict(float)    # الكميات الفعلية من الفواتير
-
-    # تجميع الأصناف والكميات المتوقعة من الـ Time Logs
-    for log in rent_doc.time_logs:
-        expected_items[log.item_code] += log.qty
-
-    # استرجاع الفواتير السابقة واستخراج الكميات المرتجعة منها
-    previous_invoices = frappe.get_all(
-        "Sales Invoice Item",
-        fields=["item_code", "rent_qty"],
-        filters={
-            "parenttype": "Sales Invoice",
-            "parent": ["in", frappe.get_all(
-                "Sales Invoice",
-                filters={"rent": rent_doc.name, "docstatus": 1, "name": ["!=", sales_invoice_doc.name]},
-                pluck="name"
-            )]
+def create_stock_entry(doc):
+    """Create and submit Stock Entry linked to the submitted Sales Invoice."""
+    new_doc = frappe.get_doc(
+        {
+            "doctype": "Stock Entry",
+            "transaction_date": doc.posting_date,
+            "stock_entry_type": "Material Transfer",
+            "customer": doc.customer,
+            "rent": doc.rent,
+            "from_warehouse": doc.from_warehouse,
+            "to_warehouse": doc.to_warehouse,
+            "sales_invoice": doc.name,
         }
     )
 
-    # تجميع الكميات المرتجعة من الفواتير السابقة
-    for item in previous_invoices:
-        actual_items[item.item_code] += item.rent_qty
+    for item in doc.items:
+        new_item = new_doc.append("items", {})
+        new_item.item_code = item.item_code
+        new_item.item_name = item.item_name
+        new_item.qty = item.rent_qty
+        new_item.s_warehouse = doc.from_warehouse
+        new_item.t_warehouse = doc.to_warehouse
+        new_item.customer = doc.customer
+        new_item.cost_center = doc.cost_center
 
-    # تجميع الكميات المرتجعة من الفاتورة الحالية
-    for item in sales_invoice_doc.items:
-        actual_items[item.item_code] += item.rent_qty
-
-    is_returned = True
-    is_partial_returned = False
-
-    # التحقق من إرجاع جميع الأصناف بالكميات المتوقعة
-    for item_code, expected_qty in expected_items.items():
-        if actual_items.get(item_code, 0) < expected_qty:
-            is_returned = False
-            break
-
-    # التحقق من وجود إرجاع جزئي إذا لم يكن الإرجاع كاملاً
-    if not is_returned:
-        for item_code, actual_qty in actual_items.items():
-            if item_code in expected_items and actual_qty > 0:
-                is_partial_returned = True
-                break
-
-    # تحديث حالة الـ Rent بناءً على النتائج
-    if is_returned:
-        frappe.db.set_value('Rent', rent_doc.name , 'status', RENT_STATUS_RETURNED)
-    elif is_partial_returned:
-        frappe.db.set_value('Rent', rent_doc.name , 'status', RENT_STATUS_PARTIAL_RETURNED)
-    frappe.db.set_value('Rent', rent_doc.name , 'sales_invoice', sales_invoice_doc.name) 
-def create_stock_entry(doc):
-    """
-    يتم استدعاؤها عند اعتماد المستند.
-    تقوم بإنشاء Stock Entry.
-    """
-    # إنشاء Stock Entry
-    new_doc = frappe.get_doc({
-        'doctype': 'Stock Entry',
-        'transaction_date': doc.posting_date,
-        'stock_entry_type': 'Material Transfer',
-        'customer': doc.customer,
-        'rent': doc.rent,
-        'from_warehouse': doc.from_warehouse,
-        'to_warehouse': doc.to_warehouse,
-        'sales_invoice': doc.name,
-    })
-    for d in doc.items:
-        new = new_doc.append("items", {})
-        new.item_code = d.item_code
-        new.item_name = d.item_name
-        new.qty = d.rent_qty
-        new.s_warehouse = doc.from_warehouse  # Set source warehouse from parent
-        new.t_warehouse = doc.to_warehouse    # Set target warehouse from parent
-        new.customer = doc.customer
-        new.cost_center = doc.cost_center
     new_doc.insert(ignore_permissions=True)
     new_doc.submit()
 
-@frappe.whitelist()
-def cancel_sales_invoice_with_unlink(sales_invoice_name, rent_name):
-    """
-    Unlink all references AND cancel the Sales Invoice in one operation.
-    This bypasses Frappe's linked document validation.
-    """
-    try:
-        # Step 1: Unlink from Rent
-        if rent_name:
-            frappe.db.set_value("Rent", rent_name, "sales_invoice", None)
-            frappe.db.set_value("Rent", rent_name, "sales_invoice_status", None)
-            frappe.db.set_value("Rent", rent_name, "stock_entry", None)
-        
-        # Step 2: Find all Stock Entries
-        stock_entries = frappe.get_all(
-            "Stock Entry",
-            filters={"sales_invoice": sales_invoice_name, "docstatus": 1},
-            pluck="name"
+    if doc.meta.has_field("stock_entry"):
+        frappe.db.set_value(
+            "Sales Invoice", doc.name, "stock_entry", new_doc.name, update_modified=False
         )
-        
-        # Step 3: Unlink from Stock Entries
-        for stock_entry_name in stock_entries:
-            frappe.db.set_value("Stock Entry", stock_entry_name, "rent", None)
-            frappe.db.set_value("Stock Entry", stock_entry_name, "sales_invoice", None)
-            frappe.db.set_value("Stock Entry", stock_entry_name, "customer", None)
-        
-        # Step 4: Unlink from Sales Invoice
-        frappe.db.set_value("Sales Invoice", sales_invoice_name, "rent", None)
-        
-        # Step 5: Cancel all Stock Entries
-        for stock_entry_name in stock_entries:
-            try:
-                stock_entry_doc = frappe.get_doc("Stock Entry", stock_entry_name)
-                stock_entry_doc.cancel()
-            except Exception as e:
-                frappe.log_error(f"Failed to cancel Stock Entry {stock_entry_name}: {str(e)}", "Cancel Stock Entry Error")
-        
-        # Step 6: Cancel the Sales Invoice itself
-        sales_invoice_doc = frappe.get_doc("Sales Invoice", sales_invoice_name)
-        sales_invoice_doc.cancel()
-        
-        # Step 7: Update Rent status
-        if rent_name:
-            frappe.db.set_value("Rent", rent_name, "status", RENT_STATUS_SUBMITTED)
-        
-        frappe.db.commit()
-        return f"Successfully cancelled Sales Invoice {sales_invoice_name} and all related Stock Entries."
-    except Exception as e:
-        frappe.db.rollback()
-        frappe.log_error(str(e), "Cancel Sales Invoice With Unlink Error")
-        raise frappe.ValidationError(f"Error during cancellation: {str(e)}")
+
+
+@frappe.whitelist()
+def cancel_sales_invoice_with_unlink(sales_invoice_name, rent_name=None):
+    """Cancel Sales Invoice through the standard workflow hooks."""
+    sales_invoice_doc = frappe.get_doc("Sales Invoice", sales_invoice_name)
+
+    if sales_invoice_doc.docstatus == 2:
+        return _("Sales Invoice {0} is already cancelled.").format(sales_invoice_name)
+
+    if sales_invoice_doc.docstatus != 1:
+        frappe.throw(_("Only submitted Sales Invoice can be cancelled."))
+
+    sales_invoice_doc.cancel()
+    _sync_rent_status(rent_name or sales_invoice_doc.get("rent"))
+
+    return _(
+        "Successfully cancelled Sales Invoice {0}, cancelled related Stock Entries, and updated Rent status."
+    ).format(sales_invoice_name)
+
 
 @frappe.whitelist()
 def unlink_all_before_cancel(sales_invoice_name, rent_name):
-    """
-    Unlink all references before cancellation.
-    This must be called BEFORE attempting to cancel the Sales Invoice.
-    """
+    """Legacy helper: unlink references for the selected Sales Invoice only."""
     try:
-        # Unlink from Rent
         if rent_name:
-            frappe.db.set_value("Rent", rent_name, "sales_invoice", None)
-            frappe.db.set_value("Rent", rent_name, "sales_invoice_status", None)
-            frappe.db.set_value("Rent", rent_name, "stock_entry", None)
-        
-        # Find all Stock Entries
-        stock_entries = frappe.get_all(
-            "Stock Entry",
-            filters={"sales_invoice": sales_invoice_name, "docstatus": 1},
-            pluck="name"
+            frappe.db.set_value(
+                "Rent",
+                rent_name,
+                {"sales_invoice": None, "sales_invoice_status": None, "stock_entry": None},
+                update_modified=False,
+            )
+
+        stock_entries = _get_related_submitted_stock_entries(sales_invoice_name)
+        _wipe_links_on_stock_entries(stock_entries)
+
+        frappe.db.set_value(
+            "Sales Invoice",
+            sales_invoice_name,
+            {"rent": None, "stock_entry": None},
+            update_modified=False,
         )
-        
-        # Unlink from Stock Entries
-        for stock_entry_name in stock_entries:
-            frappe.db.set_value("Stock Entry", stock_entry_name, "rent", None)
-            frappe.db.set_value("Stock Entry", stock_entry_name, "sales_invoice", None)
-            frappe.db.set_value("Stock Entry", stock_entry_name, "customer", None)
-        
-        # Unlink from Sales Invoice
-        frappe.db.set_value("Sales Invoice", sales_invoice_name, "rent", None)
-        
-        return f"Successfully unlinked all references. You can now cancel the Sales Invoice."
-    except Exception as e:
-        frappe.log_error(str(e), "Unlink Before Cancel Error")
-        return f"Error: {str(e)}"
+
+        return _(
+            "Successfully unlinked all references. You can now cancel the Sales Invoice."
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Unlink Before Cancel Error")
+        raise
+
 
 @frappe.whitelist()
 def unlink_stock_entries_from_rent(sales_invoice_name):
-    """
-    Unlink all Stock Entries from Rent for a given Sales Invoice.
-    Call this before cancelling the Sales Invoice to avoid linked document errors.
-    """
-    stock_entries = frappe.get_all(
-        "Stock Entry",
-        filters={"sales_invoice": sales_invoice_name, "docstatus": 1},
-        pluck="name"
+    """Legacy helper: unlink related Stock Entries from Rent/Sales Invoice references."""
+    stock_entries = _get_related_submitted_stock_entries(sales_invoice_name)
+    _wipe_links_on_stock_entries(stock_entries)
+    return _("Unlinked {0} Stock Entries for Sales Invoice {1}.").format(
+        len(stock_entries), sales_invoice_name
     )
-    for stock_entry_name in stock_entries:
-        frappe.db.set_value("Stock Entry", stock_entry_name, "rent", None)
-        frappe.db.set_value("Stock Entry", stock_entry_name, "customer", None)
-    return f"Unlinked {len(stock_entries)} Stock Entries from Rent for Sales Invoice {sales_invoice_name}."

@@ -3,17 +3,109 @@
 
 import frappe
 from frappe.model.document import Document
-import datetime
-import json
 from frappe import _
 
+
+def get_allowed_pos_profiles(user):
+    """Return enabled POS Profiles explicitly assigned to a user."""
+    assigned_profiles = frappe.get_all(
+        "POS Profile User",
+        filters={"user": user, "parenttype": "POS Profile"},
+        pluck="parent",
+    )
+
+    if not assigned_profiles:
+        return []
+
+    return frappe.get_all(
+        "POS Profile",
+        filters={"name": ["in", assigned_profiles], "disabled": 0},
+        order_by="name asc",
+        pluck="name",
+    )
+
+
+@frappe.whitelist()
+def get_user_pos_profiles(user=None):
+    """Expose allowed POS Profiles for the current user to client scripts."""
+    user = user or frappe.session.user
+    profiles = get_allowed_pos_profiles(user)
+    return {
+        "profiles": profiles,
+        "default_profile": profiles[0] if len(profiles) == 1 else None,
+    }
+
 class Rent(Document):
+
+    def _get_pos_profile_doc(self):
+        if not self.pos_profile:
+            return None
+        return frappe.get_cached_doc("POS Profile", self.pos_profile)
+
+    def apply_pos_profile_defaults(self):
+        """Fill Rent defaults from selected POS Profile if values are missing."""
+        pos_profile = self._get_pos_profile_doc()
+        if not pos_profile:
+            return
+
+        if not self.source_warehouse and pos_profile.warehouse:
+            self.source_warehouse = pos_profile.warehouse
+
+        if not self.target_warehouse and pos_profile.custom_default_target_warehouse:
+            self.target_warehouse = pos_profile.custom_default_target_warehouse
+
+        if not self.item_group and pos_profile.custom_rent_item_group:
+            self.item_group = pos_profile.custom_rent_item_group
+
+    def validate_pos_profile_access(self):
+        if not self.pos_profile:
+            frappe.throw(_("POS Profile is required for Rent."))
+
+        allowed_profiles = get_allowed_pos_profiles(frappe.session.user)
+
+        if not allowed_profiles:
+            frappe.throw(
+                _("No POS Profile is assigned to user {0}.").format(frappe.bold(frappe.session.user))
+            )
+
+        if self.pos_profile not in allowed_profiles:
+            frappe.throw(
+                _("You are not allowed to use POS Profile {0}.").format(frappe.bold(self.pos_profile))
+            )
+
+    def validate_pos_profile_configuration(self):
+        pos_profile = self._get_pos_profile_doc()
+        if not pos_profile:
+            return
+
+        if not pos_profile.custom_default_target_warehouse:
+            frappe.throw(
+                _("Default Target Warehouse is required in POS Profile {0}.").format(
+                    frappe.bold(self.pos_profile)
+                )
+            )
+
+        if not self.source_warehouse:
+            frappe.throw(
+                _("Source Warehouse is required. Set Warehouse in POS Profile {0} or on Rent.").format(
+                    frappe.bold(self.pos_profile)
+                )
+            )
+
+        if not self.target_warehouse:
+            frappe.throw(
+                _("Target Warehouse is required. Set Default Target Warehouse in POS Profile {0} or on Rent.").format(
+                    frappe.bold(self.pos_profile)
+                )
+            )
 
     def before_validate(self):
         """
         Calculate total quantity and amount from time logs.
         Convert None rates to 0 to prevent calculation errors.
         """
+        self.apply_pos_profile_defaults()
+
         tot_qty = 0
         tot_amt = 0
         for d in self.time_logs:
@@ -31,7 +123,8 @@ class Rent(Document):
         يتم استدعاؤها للتحقق من صحة المستند.
         يمكنك إضافة قواعد التحقق هنا.
         """
-        pass
+        self.validate_pos_profile_access()
+        self.validate_pos_profile_configuration()
     	# if doc.rent_type == "Daily" and doc.is_new():
 		# 	for x in doc.time_logs:
 		# 		x.rate = frappe.db.get_value('Item Price', {"item_code": x.item_code, "selling" : 1,"price_list": "Daily"}, 'price_list_rate') or 0
@@ -74,14 +167,18 @@ class Rent(Document):
 
         # إنشاء Sales Invoice إذا كان نوع الإيجار شهريًا
         if self.rent_type == "Monthly":
+            pos_profile = self._get_pos_profile_doc()
             new_invoice = frappe.get_doc({
                 'doctype': 'Sales Invoice',
                 'transaction_date': self.date,
                 'customer': self.customer,
                 'rent': self.name,
+                'pos_profile': self.pos_profile,
                 "reference_name": self.name,
                 "reference_doctype": "Rent",
                 "selling_price_list": "Monthly",
+                "letter_head": pos_profile.custom_rent_letter_head if pos_profile else None,
+                "select_print_heading": pos_profile.custom_rent_print_heading if pos_profile else None,
                 'from_warehouse': self.source_warehouse,
                 'to_warehouse': self.target_warehouse,
             })

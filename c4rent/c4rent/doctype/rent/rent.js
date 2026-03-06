@@ -1,6 +1,121 @@
 // Copyright (c) 2023, Connect 4 Systems and contributors
 // For license information, please see license.txt
 
+const get_pos_profile_doc = async (frm) => {
+    if (!frm.doc.pos_profile) {
+        return null;
+    }
+
+    if (frm._rent_pos_profile_doc && frm._rent_pos_profile_doc.name === frm.doc.pos_profile) {
+        return frm._rent_pos_profile_doc;
+    }
+
+    const posProfile = await frappe.db.get_doc('POS Profile', frm.doc.pos_profile);
+    frm._rent_pos_profile_doc = posProfile;
+    return posProfile;
+};
+
+const set_pos_profile_query = (frm, allowedProfiles = []) => {
+    frm._allowed_pos_profiles = allowedProfiles;
+
+    frm.set_query('pos_profile', function() {
+        if (!frm._allowed_pos_profiles.length) {
+            return {
+                filters: {
+                    name: ['in', ['']]
+                }
+            };
+        }
+
+        return {
+            filters: {
+                name: ['in', frm._allowed_pos_profiles]
+            }
+        };
+    });
+};
+
+const enforce_user_pos_profile = async (frm) => {
+    const response = await frappe.call({
+        method: 'c4rent.c4rent.doctype.rent.rent.get_user_pos_profiles'
+    });
+
+    const payload = response.message || {};
+    const profiles = payload.profiles || [];
+    const defaultProfile = payload.default_profile;
+
+    set_pos_profile_query(frm, profiles);
+
+    if (!profiles.length) {
+        frm.disable_save();
+        if (!frm._shown_no_pos_profile_warning) {
+            frm._shown_no_pos_profile_warning = true;
+            frappe.msgprint({
+                title: __('POS Profile Required'),
+                indicator: 'red',
+                message: __('No POS Profile is assigned to your user. Please contact System Manager.')
+            });
+        }
+        return false;
+    }
+
+    frm.enable_save();
+
+    if (!frm.doc.pos_profile && defaultProfile) {
+        await frm.set_value('pos_profile', defaultProfile);
+    }
+
+    if (frm.doc.pos_profile && !profiles.includes(frm.doc.pos_profile)) {
+        await frm.set_value('pos_profile', null);
+        frappe.msgprint({
+            title: __('Invalid POS Profile'),
+            indicator: 'orange',
+            message: __('You can only use POS Profiles assigned to your user.')
+        });
+        return false;
+    }
+
+    if (!frm.doc.pos_profile && profiles.length > 1 && !frm._shown_select_pos_profile_hint) {
+        frm._shown_select_pos_profile_hint = true;
+        frappe.show_alert({
+            message: __('Select one POS Profile to continue.'),
+            indicator: 'orange'
+        });
+    }
+
+    return true;
+};
+
+const apply_pos_profile_defaults = async (frm, force = false) => {
+    const posProfile = await get_pos_profile_doc(frm);
+    if (!posProfile) {
+        return null;
+    }
+
+    if (posProfile.warehouse && (force || !frm.doc.source_warehouse) && frm.doc.source_warehouse !== posProfile.warehouse) {
+        await frm.set_value('source_warehouse', posProfile.warehouse);
+    }
+
+    if (
+        posProfile.custom_default_target_warehouse
+        && (force || !frm.doc.target_warehouse)
+        && frm.doc.target_warehouse !== posProfile.custom_default_target_warehouse
+    ) {
+        await frm.set_value('target_warehouse', posProfile.custom_default_target_warehouse);
+    }
+
+    if (posProfile.custom_rent_item_group && (force || !frm.doc.item_group) && frm.doc.item_group !== posProfile.custom_rent_item_group) {
+        await frm.set_value('item_group', posProfile.custom_rent_item_group);
+    }
+
+    return posProfile;
+};
+
+const get_effective_daily_price_list = async (frm) => {
+    const posProfile = await get_pos_profile_doc(frm);
+    return (posProfile && posProfile.selling_price_list) ? posProfile.selling_price_list : 'Daily';
+};
+
 frappe.ui.form.on('Rent', {
     refresh: function(frm) {
         if (frm.doc.docstatus != 1) {
@@ -14,33 +129,15 @@ frappe.ui.form.on('Rent', {
     item_group: function(frm) {
         load_items(frm,frm.doc.item_group); // Load items based on the selected item group
     },
-    onload: function (frm) {
+    pos_profile: async function(frm) {
+        frm._rent_pos_profile_doc = null;
+        await apply_pos_profile_defaults(frm, true);
+    },
+    onload: async function (frm) {
         update_sales_invoice_status(frm);
-        // استخدام دالة غير متزامنة لجلب القيمة
-        frappe.db.get_single_value('Rent Settings', 'default_target_warehouse')
-            .then(defaultTargetWarehouse => {
-                if (defaultTargetWarehouse) {
-                    // التأكد من وجود المستودع قبل التعيين
-                    frappe.db.exists('Warehouse', defaultTargetWarehouse)
-                        .then(exists => {
-                            if (exists) {
-                                frm.set_value("target_warehouse", defaultTargetWarehouse);
-                            } else {
-                                frappe.msgprint({
-                                    title: __("مستودع غير موجود"),
-                                    indicator: "red",
-                                    message: __("المستودع المحدد في الإعدادات غير موجود: {0}", [defaultTargetWarehouse])
-                                });
-                            }
-                        });
-                } else {
-                    frappe.msgprint({
-                        title: __("إعدادات ناقصة"),
-                        indicator: "red",
-                        message: __("يجب تعبئة حقل 'Default Target Warehouse' في إعدادات التأجير أولاً")
-                    });
-                }
-            });
+        await enforce_user_pos_profile(frm);
+        await apply_pos_profile_defaults(frm);
+
         initialize_slider(frm);
         if (frm.doc.item_group) {
             load_items(frm, frm.doc.item_group);
@@ -78,17 +175,32 @@ frappe.ui.form.on("Rent", {
             } else {
                 // Enable the button if the status is not "Returned"
                 frm.enable_save(); // Re-enable saving
-                frm.add_custom_button(__("Sales Invoice"), function() {
-                    frappe.route_options = {
-                        "rent": frm.doc.name,
-                        "customer": frm.doc.customer,
-                        "branch": frm.doc.branch,
-                        "cost_center": frm.doc.cost_center,
-                        "from_warehouse": frm.doc.target_warehouse,
-                        "to_warehouse": frm.doc.source_warehouse,
-                        "selling_price_list": "Daily",
-                        "cost_center": frm.doc.cost_center,
+                frm.add_custom_button(__("Sales Invoice"), async function() {
+                    if (!frm.doc.pos_profile) {
+                        frappe.throw(__('Please select a POS Profile first.'));
+                    }
+
+                    const posProfile = await get_pos_profile_doc(frm);
+                    const routeOptions = {
+                        rent: frm.doc.name,
+                        customer: frm.doc.customer,
+                        branch: frm.doc.branch,
+                        cost_center: frm.doc.cost_center,
+                        from_warehouse: frm.doc.target_warehouse,
+                        to_warehouse: frm.doc.source_warehouse,
+                        pos_profile: frm.doc.pos_profile,
+                        selling_price_list: (posProfile && posProfile.selling_price_list) ? posProfile.selling_price_list : 'Daily'
                     };
+
+                    if (posProfile && posProfile.custom_rent_letter_head) {
+                        routeOptions.letter_head = posProfile.custom_rent_letter_head;
+                    }
+
+                    if (posProfile && posProfile.custom_rent_print_heading) {
+                        routeOptions.select_print_heading = posProfile.custom_rent_print_heading;
+                    }
+
+                    frappe.route_options = routeOptions;
                     frappe.new_doc("Sales Invoice");
                 }, __("Create"));
             }
@@ -126,9 +238,11 @@ frappe.ui.form.on("Rent", "validate", function(frm, cdt, cdn) {
 });
 
 // Modified the following 'item_code' event to correctly update the rate field in the 'Rent Detail' table.
-frappe.ui.form.on("Rent Detail", "item_code", function(frm, cdt, cdn) {
+frappe.ui.form.on("Rent Detail", "item_code", async function(frm, cdt, cdn) {
     const row = locals[cdt][cdn]; // Get current row
-    const priceList = frm.doc.rent_type == "Daily" ? "Daily" : "Monthly";
+    const priceList = frm.doc.rent_type === 'Daily'
+        ? await get_effective_daily_price_list(frm)
+        : 'Monthly';
 
     if (row.item_code) {
         frappe.call({
@@ -621,8 +735,10 @@ function initialize_item_slider(frm, container) {
 //----------------------------------------------------------------------------------
 // Add item to sub-table
 //----------------------------------------------------------------------------------
-function add_item_to_table(frm, item_code) {
-    const priceList = frm.doc.rent_type === "Daily" ? "Daily" : "Monthly";
+async function add_item_to_table(frm, item_code) {
+    const priceList = frm.doc.rent_type === 'Daily'
+        ? await get_effective_daily_price_list(frm)
+        : 'Monthly';
     frappe.call({
         method: 'frappe.client.get',
         args: {

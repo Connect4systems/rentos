@@ -36,6 +36,7 @@
   "section_break_raer",
   "mobile_no",
   "rent_type",
+  "pos_profile",
   "item_group",
   "column_break_xmyy",
   "stock_entry",
@@ -118,6 +119,14 @@
    "fieldtype": "Select",
    "label": "Rent Type",
    "options": "Daily\nMonthly"
+  },
+  {
+   "fieldname": "pos_profile",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "POS Profile",
+   "options": "POS Profile",
+   "reqd": 1
   },
   {
    "fieldname": "section_break_5",

@@ -25,6 +25,35 @@ frappe.ui.form.on("Sales Invoice", {
     }
 });
 
+const get_rent_pos_profile = async (frm) => {
+    if (frm.doc.pos_profile) {
+        return frm.doc.pos_profile;
+    }
+
+    if (!frm.doc.rent) {
+        return null;
+    }
+
+    const rentValue = await frappe.db.get_value('Rent', frm.doc.rent, 'pos_profile');
+    const posProfile = rentValue.message ? rentValue.message.pos_profile : null;
+
+    if (posProfile && !frm.doc.pos_profile) {
+        await frm.set_value('pos_profile', posProfile);
+    }
+
+    return posProfile;
+};
+
+const get_pos_profile_income_account = async (frm) => {
+    const posProfile = await get_rent_pos_profile(frm);
+    if (!posProfile) {
+        return null;
+    }
+
+    const profileValue = await frappe.db.get_value('POS Profile', posProfile, 'custom_rent_income_account');
+    return profileValue.message ? profileValue.message.custom_rent_income_account : null;
+};
+
 const add_unlink_cancel_button = (frm) => {
     if (!frm.page.btn_unlink_cancel_added) {
         frm.add_custom_button(__('Unlink & Cancel'), function() {
@@ -89,14 +118,13 @@ const check_remaining_quantities = (frm) => {
 };
 
 const fetch_items = (frm, remaining_items) => {
-    // جلب قيمة income_account بشكل غير متزامن
-    frappe.db.get_single_value('Rent Settings', 'income_account')
+    get_pos_profile_income_account(frm)
     .then(incomeAccount => {
         if (!incomeAccount) {
             frappe.msgprint({
                 title: __("إعدادات ناقصة"),
                 indicator: "red",
-                message: __("يجب تعبئة حقل 'Income Account' في إعدادات التأجير قبل المتابعة")
+                message: __("Please set 'Default Rent Income Account' in the selected POS Profile before continuing")
             });
             return; // إيقاف التنفيذ إذا لم توجد القيمة
         }
@@ -122,7 +150,7 @@ const fetch_items = (frm, remaining_items) => {
         frm.refresh_field('items');
     })
     .catch(error => {
-        console.error('Error fetching income account:', error);
+        console.error('Error fetching POS Profile income account:', error);
     });
 };
 

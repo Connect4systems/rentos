@@ -205,6 +205,16 @@ class Rent(Document):
         new_doc.submit()
         frappe.db.set_value("Rent", self.name, "stock_entry", new_doc.name)
 
+        frappe.msgprint(
+            _(
+                "Material Transfer Stock Entry {0} was created from {1} to {2}."
+            ).format(
+                frappe.bold(new_doc.name),
+                frappe.bold(self.source_warehouse),
+                frappe.bold(self.target_warehouse),
+            )
+        )
+
         # تحديث حالة Rent إلى "Submitted"
         self.db_set('status', 'Submitted')
 

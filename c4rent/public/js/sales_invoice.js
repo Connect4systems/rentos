@@ -1,8 +1,9 @@
 frappe.ui.form.on("Sales Invoice", {
-    onload: function(frm) {
-        if (frm.doc.__islocal && frm.doc.selling_price_list == "Daily"){
-            if(frm.doc.rent) {
-            check_remaining_quantities(frm);
+    onload: async function(frm) {
+        if (frm.doc.__islocal && frm.doc.rent) {
+            const isDailyRent = await is_daily_rent_invoice(frm);
+            if (isDailyRent) {
+                check_remaining_quantities(frm);
             }
         }
         
@@ -25,17 +26,37 @@ frappe.ui.form.on("Sales Invoice", {
     }
 });
 
+const get_linked_rent_data = async (frm) => {
+    if (!frm.doc.rent) {
+        return null;
+    }
+
+    if (frm._linked_rent_data && frm._linked_rent_data.name === frm.doc.rent) {
+        return frm._linked_rent_data;
+    }
+
+    const rentValue = await frappe.db.get_value('Rent', frm.doc.rent, ['rent_type', 'pos_profile']);
+    const data = {
+        name: frm.doc.rent,
+        rent_type: rentValue.message ? rentValue.message.rent_type : null,
+        pos_profile: rentValue.message ? rentValue.message.pos_profile : null
+    };
+    frm._linked_rent_data = data;
+    return data;
+};
+
+const is_daily_rent_invoice = async (frm) => {
+    const rentData = await get_linked_rent_data(frm);
+    return !!(rentData && rentData.rent_type === 'Daily');
+};
+
 const get_rent_pos_profile = async (frm) => {
     if (frm.doc.pos_profile) {
         return frm.doc.pos_profile;
     }
 
-    if (!frm.doc.rent) {
-        return null;
-    }
-
-    const rentValue = await frappe.db.get_value('Rent', frm.doc.rent, 'pos_profile');
-    const posProfile = rentValue.message ? rentValue.message.pos_profile : null;
+    const rentData = await get_linked_rent_data(frm);
+    const posProfile = rentData ? rentData.pos_profile : null;
 
     if (posProfile && !frm.doc.pos_profile) {
         await frm.set_value('pos_profile', posProfile);
@@ -50,8 +71,8 @@ const get_pos_profile_income_account = async (frm) => {
         return null;
     }
 
-    const profileValue = await frappe.db.get_value('POS Profile', posProfile, 'custom_rent_income_account');
-    return profileValue.message ? profileValue.message.custom_rent_income_account : null;
+    const profileValue = await frappe.db.get_value('POS Profile', posProfile, 'income_account');
+    return profileValue.message ? profileValue.message.income_account : null;
 };
 
 const add_unlink_cancel_button = (frm) => {
@@ -117,41 +138,41 @@ const check_remaining_quantities = (frm) => {
     });
 };
 
-const fetch_items = (frm, remaining_items) => {
-    get_pos_profile_income_account(frm)
-    .then(incomeAccount => {
+const fetch_items = async (frm, remaining_items) => {
+    try {
+        const incomeAccount = await get_pos_profile_income_account(frm);
         if (!incomeAccount) {
             frappe.msgprint({
                 title: __("إعدادات ناقصة"),
                 indicator: "red",
-                message: __("Please set 'Default Rent Income Account' in the selected POS Profile before continuing")
+                message: __("Please set 'Income Account' in the selected POS Profile before continuing")
             });
-            return; // إيقاف التنفيذ إذا لم توجد القيمة
+            return;
         }
 
+        const isDailyRent = await is_daily_rent_invoice(frm);
         frm.clear_table('items');
-        
+
         remaining_items.forEach(item => {
             const row = frm.add_child('items');
             row.item_code = item.item_code;
             row.item_name = item.item_name;
             row.description = item.item_name;
-            row.income_account = incomeAccount; // استخدام القيمة التي تم جلبها
+            row.income_account = incomeAccount;
             row.rate = item.rate;
             row.uom = item.uom;
             row.rent_detail = item.name;
             row.rent_qty = item.remaining_qty;
-            
-            if(frm.doc.selling_price_list == "Daily") {
+
+            if (isDailyRent) {
                 calculate_daily_quantities(frm, item, row);
             }
         });
-        
+
         frm.refresh_field('items');
-    })
-    .catch(error => {
+    } catch (error) {
         console.error('Error fetching POS Profile income account:', error);
-    });
+    }
 };
 
 const calculate_daily_quantities = (frm, item, row) => {

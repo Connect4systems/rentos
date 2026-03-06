@@ -35,12 +35,40 @@ def get_user_pos_profiles(user=None):
         "default_profile": profiles[0] if len(profiles) == 1 else None,
     }
 
+
+def get_pos_profile_item_groups(pos_profile):
+    """Return distinct item groups from POS Profile item group child table."""
+    item_groups = []
+    if not pos_profile:
+        return item_groups
+
+    for row in pos_profile.get("item_groups") or []:
+        item_group = row.get("item_group")
+        if item_group and item_group not in item_groups:
+            item_groups.append(item_group)
+
+    return item_groups
+
 class Rent(Document):
 
     def _get_pos_profile_doc(self):
         if not self.pos_profile:
             return None
         return frappe.get_cached_doc("POS Profile", self.pos_profile)
+
+    def get_price_list_for_rent_type(self):
+        pos_profile = self._get_pos_profile_doc()
+        if not pos_profile:
+            return None
+
+        if self.rent_type == "Monthly":
+            return pos_profile.custom_monthly_price_list
+
+        return pos_profile.selling_price_list
+
+    @staticmethod
+    def get_pos_profile_print_heading(pos_profile):
+        return getattr(pos_profile, "print_heading", None) or getattr(pos_profile, "select_print_heading", None)
 
     def apply_pos_profile_defaults(self):
         """Fill Rent defaults from selected POS Profile if values are missing."""
@@ -54,8 +82,9 @@ class Rent(Document):
         if not self.target_warehouse and pos_profile.custom_default_target_warehouse:
             self.target_warehouse = pos_profile.custom_default_target_warehouse
 
-        if not self.item_group and pos_profile.custom_rent_item_group:
-            self.item_group = pos_profile.custom_rent_item_group
+        pos_profile_item_groups = get_pos_profile_item_groups(pos_profile)
+        if not self.item_group and pos_profile_item_groups:
+            self.item_group = pos_profile_item_groups[0]
 
     def validate_pos_profile_access(self):
         if not self.pos_profile:
@@ -95,6 +124,20 @@ class Rent(Document):
         if not self.target_warehouse:
             frappe.throw(
                 _("Target Warehouse is required. Set Default Target Warehouse in POS Profile {0} or on Rent.").format(
+                    frappe.bold(self.pos_profile)
+                )
+            )
+
+        if self.rent_type == "Daily" and not pos_profile.selling_price_list:
+            frappe.throw(
+                _("Price List is required in POS Profile {0} for Daily rent.").format(
+                    frappe.bold(self.pos_profile)
+                )
+            )
+
+        if self.rent_type == "Monthly" and not pos_profile.custom_monthly_price_list:
+            frappe.throw(
+                _("Monthly Price List is required in POS Profile {0} for Monthly rent.").format(
                     frappe.bold(self.pos_profile)
                 )
             )
@@ -168,6 +211,7 @@ class Rent(Document):
         # إنشاء Sales Invoice إذا كان نوع الإيجار شهريًا
         if self.rent_type == "Monthly":
             pos_profile = self._get_pos_profile_doc()
+            monthly_price_list = self.get_price_list_for_rent_type() or "Monthly"
             new_invoice = frappe.get_doc({
                 'doctype': 'Sales Invoice',
                 'transaction_date': self.date,
@@ -176,9 +220,9 @@ class Rent(Document):
                 'pos_profile': self.pos_profile,
                 "reference_name": self.name,
                 "reference_doctype": "Rent",
-                "selling_price_list": "Monthly",
-                "letter_head": pos_profile.custom_rent_letter_head if pos_profile else None,
-                "select_print_heading": pos_profile.custom_rent_print_heading if pos_profile else None,
+                "selling_price_list": monthly_price_list,
+                "letter_head": pos_profile.letter_head if pos_profile else None,
+                "select_print_heading": self.get_pos_profile_print_heading(pos_profile) if pos_profile else None,
                 'from_warehouse': self.source_warehouse,
                 'to_warehouse': self.target_warehouse,
             })
@@ -237,11 +281,16 @@ class Rent(Document):
         """
         يتم استدعاؤها للحصول على مجموعات الأصناف.
         """
+        filters = {"in_slider": 1}
+        pos_profile = self._get_pos_profile_doc()
+        pos_profile_item_groups = get_pos_profile_item_groups(pos_profile)
+
+        if pos_profile_item_groups:
+            filters = {"name": ["in", pos_profile_item_groups]}
+
         item_group = frappe.get_list("Item Group",
             fields=["name", "image"],
-            filters={
-                'in_slider': 1
-            },
+            filters=filters,
         )
         for ig in item_group:
             if ig.image:
@@ -279,7 +328,7 @@ class Rent(Document):
             for i in items:
                 if i.image:
                     i.image = f"{frappe.utils.get_url()}/{i.image}"
-                return items
+            return items
         except Exception as e:
             frappe.log_error(_("Error fetching items for Item Group '{0}'. Error: {1}").format(item_group, str(e)), "get_items")
             return []

@@ -15,6 +15,21 @@ const get_pos_profile_doc = async (frm) => {
     return posProfile;
 };
 
+const get_pos_profile_item_groups = (posProfile) => {
+    if (!posProfile || !Array.isArray(posProfile.item_groups)) {
+        return [];
+    }
+
+    const groups = [];
+    posProfile.item_groups.forEach(row => {
+        if (row.item_group && !groups.includes(row.item_group)) {
+            groups.push(row.item_group);
+        }
+    });
+
+    return groups;
+};
+
 const set_pos_profile_query = (frm, allowedProfiles = []) => {
     frm._allowed_pos_profiles = allowedProfiles;
 
@@ -104,15 +119,20 @@ const apply_pos_profile_defaults = async (frm, force = false) => {
         await frm.set_value('target_warehouse', posProfile.custom_default_target_warehouse);
     }
 
-    if (posProfile.custom_rent_item_group && (force || !frm.doc.item_group) && frm.doc.item_group !== posProfile.custom_rent_item_group) {
-        await frm.set_value('item_group', posProfile.custom_rent_item_group);
+    const itemGroups = get_pos_profile_item_groups(posProfile);
+    if (itemGroups.length && (force || !frm.doc.item_group) && frm.doc.item_group !== itemGroups[0]) {
+        await frm.set_value('item_group', itemGroups[0]);
     }
 
     return posProfile;
 };
 
-const get_effective_daily_price_list = async (frm) => {
+const get_effective_price_list = async (frm) => {
     const posProfile = await get_pos_profile_doc(frm);
+    if (frm.doc.rent_type === 'Monthly') {
+        return (posProfile && posProfile.custom_monthly_price_list) ? posProfile.custom_monthly_price_list : 'Monthly';
+    }
+
     return (posProfile && posProfile.selling_price_list) ? posProfile.selling_price_list : 'Daily';
 };
 
@@ -181,6 +201,7 @@ frappe.ui.form.on("Rent", {
                     }
 
                     const posProfile = await get_pos_profile_doc(frm);
+                    const priceList = await get_effective_price_list(frm);
                     const routeOptions = {
                         rent: frm.doc.name,
                         customer: frm.doc.customer,
@@ -189,15 +210,20 @@ frappe.ui.form.on("Rent", {
                         from_warehouse: frm.doc.target_warehouse,
                         to_warehouse: frm.doc.source_warehouse,
                         pos_profile: frm.doc.pos_profile,
-                        selling_price_list: (posProfile && posProfile.selling_price_list) ? posProfile.selling_price_list : 'Daily'
+                        selling_price_list: priceList
                     };
 
-                    if (posProfile && posProfile.custom_rent_letter_head) {
-                        routeOptions.letter_head = posProfile.custom_rent_letter_head;
+                    if (posProfile && posProfile.letter_head) {
+                        routeOptions.letter_head = posProfile.letter_head;
                     }
 
-                    if (posProfile && posProfile.custom_rent_print_heading) {
-                        routeOptions.select_print_heading = posProfile.custom_rent_print_heading;
+                    const printHeading = posProfile ? (posProfile.print_heading || posProfile.select_print_heading) : null;
+                    if (printHeading) {
+                        routeOptions.select_print_heading = printHeading;
+                    }
+
+                    if (posProfile && posProfile.print_format) {
+                        routeOptions.print_format = posProfile.print_format;
                     }
 
                     frappe.route_options = routeOptions;
@@ -240,9 +266,7 @@ frappe.ui.form.on("Rent", "validate", function(frm, cdt, cdn) {
 // Modified the following 'item_code' event to correctly update the rate field in the 'Rent Detail' table.
 frappe.ui.form.on("Rent Detail", "item_code", async function(frm, cdt, cdn) {
     const row = locals[cdt][cdn]; // Get current row
-    const priceList = frm.doc.rent_type === 'Daily'
-        ? await get_effective_daily_price_list(frm)
-        : 'Monthly';
+    const priceList = await get_effective_price_list(frm);
 
     if (row.item_code) {
         frappe.call({
@@ -736,9 +760,7 @@ function initialize_item_slider(frm, container) {
 // Add item to sub-table
 //----------------------------------------------------------------------------------
 async function add_item_to_table(frm, item_code) {
-    const priceList = frm.doc.rent_type === 'Daily'
-        ? await get_effective_daily_price_list(frm)
-        : 'Monthly';
+    const priceList = await get_effective_price_list(frm);
     frappe.call({
         method: 'frappe.client.get',
         args: {
